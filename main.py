@@ -7,9 +7,13 @@ import discord
 from discord.ext import commands, tasks
 from discord import app_commands
 
-# We assume database.py is upgraded to handle aiosqlite (async operations)
+# Import the Hugging Face web server bypass
+from keep_alive import keep_alive
+
+# Import our async database driver
 from database import NovelDatabase
 
+# Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("NovelBot")
 
@@ -27,7 +31,6 @@ class NovelBot(commands.Bot):
             status=discord.Status.online
         )
         
-        # The database object will now use asynchronous methods
         self.db = NovelDatabase("novel_library.db")
 
     async def setup_hook(self):
@@ -41,11 +44,12 @@ class NovelBot(commands.Bot):
         # Register persistent views so buttons work after restarts
         from cogs.reading import ReadingView, InventoryView
         self.add_view(ReadingView(self, self.db, user_id=None, dynamic_persistent=True))
-        self.add_view(InventoryView(self, self.db, user_id=None)) 
+        # Note: Inventory view relies on fresh user data, but we register the base for safety
+        self.add_view(InventoryView(self, self.db, user_id=None, inventory_data=[])) 
         
         self.auto_cleanup_inactive_sessions.start()
         
-        # Attach the global error handler to the application command tree
+        # Attach the global error handler
         self.tree.on_error = self.on_app_command_error
         
         logger.info("Syncing global slash commands...")
@@ -58,7 +62,7 @@ class NovelBot(commands.Bot):
         logger.info("--------------------------------------------------")
 
     async def on_app_command_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
-        """Global error handler to catch bugs and missing permissions smoothly."""
+        """Global error handler to catch bugs smoothly."""
         if isinstance(error, app_commands.MissingPermissions):
             msg = "❌ You don't have the required administrative permissions to run this command."
         elif isinstance(error, app_commands.CommandOnCooldown):
@@ -119,9 +123,7 @@ class NovelBot(commands.Bot):
             if datetime.utcnow() - last_interacted > timedelta(hours=48):
                 channel = self.get_channel(channel_id)
                 if channel:
-                    # Check the toggle setting for this specific server
                     settings = await self.db.get_guild_settings(channel.guild.id)
-                    # settings structure: (category_id, search_id, lounge_id, cleanup_disabled)
                     if settings and len(settings) > 3 and settings[3] == 1:
                         continue  # Skip if the admin disabled auto-cleanup
 
@@ -138,7 +140,6 @@ class NovelBot(commands.Bot):
                     except Exception as e:
                         logger.error(f"Failed to delete channel {channel_id}: {e}")
                 
-                # Strip the active channel link but keep the chapter progress
                 await self.db.clear_active_channel(user_id)
 
     @auto_cleanup_inactive_sessions.before_loop
@@ -149,6 +150,11 @@ if __name__ == "__main__":
     TOKEN = os.getenv("DISCORD_BOT_TOKEN")
     if not TOKEN:
         logger.critical("CRITICAL ERROR: 'DISCORD_BOT_TOKEN' environment variable not found.")
+        print("Please add DISCORD_BOT_TOKEN to your Hugging Face Secrets.")
     else:
+        # 1. Start the Hugging Face dummy web server so it doesn't crash
+        keep_alive()
+        
+        # 2. Start the Discord bot
         bot = NovelBot()
         bot.run(TOKEN)
