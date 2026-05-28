@@ -1,22 +1,22 @@
 import os
 import asyncio
 import logging
+import traceback
 from datetime import datetime, timedelta
 import discord
 from discord.ext import commands, tasks
+from discord import app_commands
 
-# Import our database logic (File 2)
+# We assume database.py is upgraded to handle aiosqlite (async operations)
 from database import NovelDatabase
 
-# Configure Logging for production/GitHub transparency
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("NovelBot")
 
 class NovelBot(commands.Bot):
     def __init__(self):
-        # Configure required gateway intents
         intents = discord.Intents.default()
-        intents.message_content = True  # Required to read uploaded .txt/.epub files
+        intents.message_content = True  
         intents.guilds = True
         intents.members = True
 
@@ -27,25 +27,26 @@ class NovelBot(commands.Bot):
             status=discord.Status.online
         )
         
-        # Initialize our database helper class
+        # The database object will now use asynchronous methods
         self.db = NovelDatabase("novel_library.db")
 
     async def setup_hook(self):
-        """Executed before the bot logs into Discord. Used to load components and views."""
-        logger.info("Initializing database schemas...")
-        self.db.initialize_tables()
+        """Executed before the bot logs in. Loads components, views, and syncs commands."""
+        logger.info("Initializing async database schemas...")
+        await self.db.initialize_tables()
 
-        # Load our core feature Cog (File 3)
         logger.info("Loading extensions...")
         await self.load_extension("cogs.reading")
 
-        # Crucial: Register persistent views here so buttons continue working after a bot restart
-        # We import inside the hook to prevent circular dependency issues
-        from cogs.reading import ReadingView
+        # Register persistent views so buttons work after restarts
+        from cogs.reading import ReadingView, InventoryView
         self.add_view(ReadingView(self, self.db, user_id=None, dynamic_persistent=True))
+        self.add_view(InventoryView(self, self.db, user_id=None)) 
         
-        # Start our automated server background maintenance tasks
         self.auto_cleanup_inactive_sessions.start()
+        
+        # Attach the global error handler to the application command tree
+        self.tree.on_error = self.on_app_command_error
         
         logger.info("Syncing global slash commands...")
         await self.tree.sync()
@@ -56,33 +57,42 @@ class NovelBot(commands.Bot):
         logger.info(f"Connected to {len(self.guilds)} servers.")
         logger.info("--------------------------------------------------")
 
+    async def on_app_command_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
+        """Global error handler to catch bugs and missing permissions smoothly."""
+        if isinstance(error, app_commands.MissingPermissions):
+            msg = "❌ You don't have the required administrative permissions to run this command."
+        elif isinstance(error, app_commands.CommandOnCooldown):
+            msg = f"⏳ Slow down! Try again in {round(error.retry_after, 2)} seconds."
+        else:
+            msg = f"⚠️ An unexpected error occurred: `{str(error)}`"
+            logger.error(f"Command Exception in {interaction.command.name}: {error}")
+            traceback.print_exception(type(error), error, error.__traceback__)
+
+        if interaction.response.is_done():
+            await interaction.followup.send(msg, ephemeral=True)
+        else:
+            await interaction.response.send_message(msg, ephemeral=True)
+
     async def on_guild_join(self, guild: discord.Guild):
-        """Triggered when the bot is invited to a new server. Sends an interactive onboarding panel."""
-        logger.info(f"Joined a new server: {guild.name} ({guild.id})")
-        
-        # Find the best text channel to drop a welcome notification
+        """Onboarding panel for new servers."""
         target_channel = next(
             (ch for ch in guild.text_channels if ch.permissions_for(guild.me).send_messages), 
             None
         )
-        
         if not target_channel:
             return
 
         embed = discord.Embed(
-            title=f"📚 Welcome to your Ultimate Reading Assistant!",
+            title="📚 Welcome to your Ultimate Reading Assistant!",
             description=(
                 f"Thank you for adding me to **{guild.name}**!\n\n"
-                "I can convert text/epubs into distraction-free reading environments where "
-                "users can seamlessly read with button-based scroll systems.\n\n"
+                "I create clean, dedicated reading environments using a responsive UI.\n\n"
                 "### 🛠️ Next Steps:\n"
-                "An administrator needs to run the setup command to build out the "
-                "dedicated **Reading Corner category and system channels**.\n\n"
-                "Use the slash command below to complete deployment:"
+                "An administrator needs to run `/setup` to build out the "
+                "dedicated Reading Corner category and system channels."
             ),
             color=discord.Color.brand_green()
         )
-        embed.add_field(name="Setup Command", value="`/setup [optional_custom_bot_name]`", inline=False)
         embed.set_footer(text="Powered by NovelBot Engine")
 
         try:
@@ -92,13 +102,9 @@ class NovelBot(commands.Bot):
 
     @tasks.loop(hours=1.0)
     async def auto_cleanup_inactive_sessions(self):
-        """
-        Background safety task. Checks active reading channels hourly.
-        If a channel has been inactive for more than 48 hours, it automatically 
-        archives (deletes) it to keep the server below Discord's 500-channel limit.
-        """
+        """Checks for active reading channels idle for 48+ hours and safely deletes them."""
         logger.info("Running automated inactivity check on reading channels...")
-        active_sessions = self.db.get_all_active_sessions()
+        active_sessions = await self.db.get_all_active_sessions()
 
         for session in active_sessions:
             user_id, channel_id, last_interacted_str = session
@@ -110,41 +116,39 @@ class NovelBot(commands.Bot):
             except ValueError:
                 continue
 
-            # Check if the channel has been sitting idle for over 48 hours
             if datetime.utcnow() - last_interacted > timedelta(hours=48):
                 channel = self.get_channel(channel_id)
                 if channel:
+                    # Check the toggle setting for this specific server
+                    settings = await self.db.get_guild_settings(channel.guild.id)
+                    # settings structure: (category_id, search_id, lounge_id, cleanup_disabled)
+                    if settings and len(settings) > 3 and settings[3] == 1:
+                        continue  # Skip if the admin disabled auto-cleanup
+
                     try:
-                        # 1. Notify the user if accessible
                         user = self.get_user(user_id)
                         if user:
                             await user.send(
-                                f"💤 Your reading session for channel `#{channel.name}` was closed due to "
-                                "48 hours of inactivity. Your progress has been safely saved! "
-                                "Type `/read` anywhere in the server to pick up right where you left off."
+                                f"💤 Your reading session for `#{channel.name}` was archived due to "
+                                "48 hours of inactivity. Your progress is saved! Use `/inventory` to resume."
                             )
                         
-                        # 2. Delete the channel safely
-                        await channel.delete(reason="Automated session cleanup due to user inactivity.")
+                        await channel.delete(reason="Automated inactivity cleanup.")
                         logger.info(f"Archived inactive channel {channel_id} for User {user_id}")
                     except Exception as e:
-                        logger.error(f"Failed to cleanly delete inactive channel {channel_id}: {e}")
+                        logger.error(f"Failed to delete channel {channel_id}: {e}")
                 
-                # Update database: remove the active channel reference but preserve chapter progress
-                self.db.clear_active_channel(user_id)
+                # Strip the active channel link but keep the chapter progress
+                await self.db.clear_active_channel(user_id)
 
     @auto_cleanup_inactive_sessions.before_loop
     async def before_cleanup_loop(self):
-        # Wait until the bot connection is completely ready before executing loop cycles
         await self.wait_until_ready()
 
-
 if __name__ == "__main__":
-    # Ensure a proper discord token variable is set inside your local environments
     TOKEN = os.getenv("DISCORD_BOT_TOKEN")
     if not TOKEN:
         logger.critical("CRITICAL ERROR: 'DISCORD_BOT_TOKEN' environment variable not found.")
-        print("Please set your bot token using: export DISCORD_BOT_TOKEN='your_token'")
     else:
         bot = NovelBot()
         bot.run(TOKEN)
